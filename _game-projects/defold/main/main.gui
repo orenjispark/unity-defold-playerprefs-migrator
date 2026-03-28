@@ -1,0 +1,23 @@
+script: "/main/main.gui_script"
+fonts {
+  name: "default"
+  font: "/assets/font/default-font.font"
+}
+nodes {
+  position {
+    x: 480.0
+    y: 320.0
+  }
+  size {
+    x: 800.0
+    y: 300.0
+  }
+  type: TYPE_TEXT
+  text: "..."
+  font: "default"
+  id: "save_data_text"
+  line_break: true
+  inherit_alpha: true
+}
+material: "/builtins/materials/gui.material"
+adjust_reference: ADJUST_REFERENCE_PARENT

@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta http-equiv="X-UA-Compatible" content="IE=edge,chrome=1">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=0, minimal-ui, shrink-to-fit=no, viewport-fit=cover">
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<!-- The above 4 meta tags *must* come first in the head; any other head content must come *after* these tags -->
+
+	<title>{{project.title}} {{project.version}}</title>
+	<script>
+		window.UnityMigrator = (function () {
+    "use strict";
+
+    var _ready  = false;
+    var _result = null;  // JSON string on success, null if key not found
+    var _error  = null;  // error message string on failure
+
+    // ── discover state ────────────────────────────────────────────────────────
+    var _discoverReady  = false;
+    var _discoverHashes = null;  // JSON-encoded array of hash strings
+    var _discoverError  = null;
+
+    /** Escape a literal string so it is safe inside a JS RegExp */
+    function escapeRegExp(s) {
+        return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    }
+
+    /**
+     * Read a single PlayerPrefs key from Unity's IndexedDB store.
+     * Unity WebGL stores PlayerPrefs as a binary BinaryWriter format:
+     *   "UnityPrf" (8) + int32LE count + entries of:
+     *     int32LE keyLen + key bytes + uint8 type (0=int,1=float,2=string)
+     *     + .NET 7-bit-encoded string length + value bytes
+     */
+    function readPlayerPrefsKey(unityHash, keyName) {
+        return new Promise(function (resolve, reject) {
+            var openReq = indexedDB.open("/idbfs");
+
+            openReq.onerror = function () {
+                console.error("[UnityMigrator] IndexedDB open error:", openReq.error);
+                reject(new Error("IndexedDB open failed: " + openReq.error));
+            };
+
+            openReq.onsuccess = function (event) {
+                console.log("[UnityMigrator] IndexedDB opened successfully");
+                var db   = event.target.result;
+                var tx   = db.transaction(["FILE_DATA"], "readonly");
+                var store = tx.objectStore("FILE_DATA");
+
+                var unityPath = "/idbfs/" + unityHash + "/PlayerPrefs";
+                var getReq    = store.get(unityPath);
+
+                console.log("[UnityMigrator] looking up path:", unityPath);
+
+                getReq.onerror = function () {
+                    console.error("[UnityMigrator] IndexedDB get error:", getReq.error);
+                    reject(new Error("IndexedDB get failed: " + getReq.error));
+                };
+
+                getReq.onsuccess = function () {
+                    if (!getReq.result || !getReq.result.contents) {
+                        console.warn("[UnityMigrator] PlayerPrefs file not found");
+                        resolve(null);
+                        return;
+                    }
+                    try {
+                        var bytes = getReq.result.contents instanceof Uint8Array
+                            ? getReq.result.contents
+                            : new Uint8Array(getReq.result.contents);
+                        var dec = new TextDecoder();
+
+                        // .NET BinaryWriter 7-bit encoded int
+                        function read7BitInt(pos) {
+                            var result = 0, shift = 0, b;
+                            do { b = bytes[pos++]; result |= (b & 0x7F) << shift; shift += 7; } while (b & 0x80);
+                            return { value: result, end: pos };
+                        }
+
+                        // Unity WebGL binary PlayerPrefs format:
+                        //   "UnityPrf" (8 bytes) + 8 unknown header bytes
+                        //   Each entry: 7-bit keyLen + key + 7-bit valLen + val  (no type byte)
+                        var pos = 16;
+                        while (pos < bytes.length) {
+                            var kr  = read7BitInt(pos); pos = kr.end;
+                            var key = dec.decode(bytes.slice(pos, pos + kr.value)); pos += kr.value;
+                            var vr  = read7BitInt(pos); pos = vr.end;
+                            var val = dec.decode(bytes.slice(pos, pos + vr.value)); pos += vr.value;
+                            if (key === keyName) { resolve(val); return; }
+                        }
+                        resolve(null);
+                    } catch (e) {
+                        reject(new Error("Failed to parse PlayerPrefs binary: " + e));
+                    }
+                };
+            };
+        });
+    }
+
+    /**
+     * Scan the /idbfs IndexedDB for any key matching
+     * /idbfs/<32-char-hex>/PlayerPrefs and collect the hashes.
+     * Results are written to module-level variables; poll with isDiscoverReady().
+     */
+    function startDiscover() {
+        _discoverReady  = false;
+        _discoverHashes = null;
+        _discoverError  = null;
+
+        new Promise(function (resolve, reject) {
+            var openReq = indexedDB.open("/idbfs");
+
+            openReq.onerror = function () {
+                reject(new Error("IndexedDB open failed: " + openReq.error));
+            };
+
+            openReq.onsuccess = function (event) {
+                var db    = event.target.result;
+                var tx    = db.transaction(["FILE_DATA"], "readonly");
+                var store = tx.objectStore("FILE_DATA");
+                var cursorReq = store.openKeyCursor();
+                var pattern   = /^\/idbfs\/([0-9a-f]{32})\/PlayerPrefs$/;
+                var hashes    = [];
+
+                cursorReq.onsuccess = function (e) {
+                    var cursor = e.target.result;
+                    if (cursor) {
+                        var m = pattern.exec(cursor.key);
+                        if (m) hashes.push(m[1]);
+                        cursor.continue();
+                    } else {
+                        resolve(hashes);
+                    }
+                };
+                cursorReq.onerror = function () {
+                    reject(new Error("Cursor error: " + cursorReq.error));
+                };
+            };
+        })
+        .then(function (hashes) {
+            console.log("[UnityMigrator] discovered hashes:", hashes);
+            _discoverHashes = JSON.stringify(hashes);
+            _discoverReady  = true;
+        })
+        .catch(function (err) {
+            console.error("[UnityMigrator] discover error:", err);
+            _discoverError = err ? err.toString() : "unknown error";
+            _discoverReady = true;
+        });
+    }
+
+    /**
+     * Start an async fetch.  Called from Lua via html5.run().
+     * Results are written to module-level variables; poll with isReady().
+     */
+    function startFetch(unityHash, keyName) {
+        console.log("[UnityMigrator] fetch started – hash:", unityHash, "key:", keyName);
+        _ready  = false;
+        _result = null;
+        _error  = null;
+
+        readPlayerPrefsKey(unityHash, keyName)
+            .then(function (jsonStr) {
+                if (jsonStr === null) {
+                    console.log("[UnityMigrator] key not found in PlayerPrefs");
+                } else {
+                    console.log("[UnityMigrator] key found, JSON length:", jsonStr.length);
+                }
+                _result = jsonStr;   // may be null (key absent)
+                _ready  = true;
+            })
+            .catch(function (err) {
+                console.error("[UnityMigrator] fetch error:", err);
+                _error = err ? err.toString() : "unknown error";
+                _ready = true;
+            });
+    }
+
+    return {
+        /** Initiate the IndexedDB lookup (non-blocking). */
+        fetch: startFetch,
+
+        /** Returns true once the async operation has finished. */
+        isReady: function () { return _ready; },
+
+        /**
+         * Consume and return the JSON string result (or null).
+         * Resets the ready/result state for the next call.
+         */
+        getResult: function () {
+            var r   = _result;
+            _ready  = false;
+            _result = null;
+            _error  = null;
+            return r;
+        },
+
+        /**
+         * Consume and return the error string, or null if no error occurred.
+         * Resets the ready/error state for the next call.
+         */
+        getError: function () {
+            var e   = _error;
+            _error  = null;
+            return e;
+        },
+
+        // ── discover API ──────────────────────────────────────────────────────
+
+        /** Scan /idbfs for Unity PlayerPrefs files and collect their hashes. */
+        discoverHashes: startDiscover,
+
+        /** Returns true once discoverHashes() has finished. */
+        isDiscoverReady: function () { return _discoverReady; },
+
+        /**
+         * Consume and return a JSON-encoded array of discovered hash strings.
+         * Resets discover state for the next call.
+         */
+        getDiscoveredHashes: function () {
+            var h = _discoverHashes;
+            _discoverReady  = false;
+            _discoverHashes = null;
+            _discoverError  = null;
+            return h;
+        },
+
+        /** Consume and return the discover error string, or null. */
+        getDiscoverError: function () {
+            var e = _discoverError;
+            _discoverError = null;
+            return e;
+        }
+    };
+}());
+	</script>
+	<style type='text/css'>
+	/* Disable user selection to avoid strange bug in Chrome on Windows:
+	* Selecting a text outside the canvas, then clicking+draging would
+	* drag the selected text but block mouse down/up events to the engine.
+	*/
+	body {
+	{{^DEFOLD_SCALE_MODE_IS_NO_SCALE}}
+		position: fixed; /* Prevent overscroll */
+	{{/DEFOLD_SCALE_MODE_IS_NO_SCALE}}
+		margin:0;
+		padding:0;
+	}
+
+	.canvas-app-container {
+		width: 100%;
+		height: 100%;
+		position: absolute;
+		align-items: center;
+		justify-content: center;
+		overflow: hidden;
+	}
+
+	.canvas-app-container:-webkit-full-screen {
+		/* Auto width and height in Safari/Chrome fullscreen. */
+		width: auto;
+		height: auto;
+	}
+
+	#canvas {
+		outline: none;
+		border: 0;
+		width: 100%;
+		vertical-align: bottom;
+	}
+
+	#canvas-container {
+		position: relative;
+	}
+
+	canvas:focus, canvas:active {
+		outline: none;
+		border: 0;
+		ie-dummy: expression(this.hideFocus=true);
+		-moz-outline-style: none;
+	}
+
+	body, div {
+		-webkit-tap-highlight-color: rgba(0,0,0,0);
+		-webkit-touch-callout: none;
+		-webkit-user-select: none;
+		-khtml-user-select: none;
+		-moz-user-select: none;
+		-ms-user-select: none;
+		user-select: none;
+	}
+
+	{{{DEFOLD_CUSTOM_CSS_INLINE}}}
+	</style>
+</head>
+
+<body>
+
+	<div id="app-container" class="canvas-app-container">
+		<div id="running-from-file-warning" style="display: none; margin: 3em;">
+			<h1>Running from local file ⚠️</h1>
+			<p>It seems like you have opened this file by double-clicking on it. In order to test your build in a browser <b>you need to load this file from a web server</b>. You can either upload this file and the rest of the files from a Defold HTML5 bundle to a web hosting service OR host them using a local web server on your home network.</p>
+			<p><a href="https://defold.com/manuals/html5/#testing-html5-build" target="_blank">Learn more about running a local web server in the Defold HTML5 manual</a>.</p>
+		</div>
+		<div id="webgl-not-supported" style="display: none; margin: 3em;">
+			<h1>WebGL not supported ⚠️</h1>
+			<p>WebGL is not supported by your browser - visit <a href="https://get.webgl.org/">https://get.webgl.org/</a> to learn more.</p>
+		</div>
+		<div id="canvas-container" class="canvas-app-canvas-container">
+			<canvas id="canvas" class="canvas-app-canvas" tabindex="1" width="{{display.width}}" height="{{display.height}}"></canvas>
+		</div>
+		<div class="buttons-background">
+{{#html5.show_fullscreen_button}}
+			<div class="button" onclick="Module.toggleFullscreen();">Fullscreen</div>
+{{/html5.show_fullscreen_button}}
+{{#html5.show_made_with_defold}}
+			<div class="link">Made with <a href="https://defold.com/" target="_blank">Defold</a></div>
+{{/html5.show_made_with_defold}}
+		</div>
+	</div>
+	<!-- -->
+	<script>
+		// Fallback to make sure globalThis is available when running in an old
+		// browser (available from Chome 71)
+		// https://github.com/defold/defold/issues/10503
+		if (typeof globalThis === 'undefined') {
+			window.globalThis = window;
+		}
+	</script>
+	<script id='engine-loader' type='text/javascript' src="dmloader.js"></script>
+	<script id='engine-setup' type='text/javascript'>
+		// From here you can configure game startup parameters via the CUSTOM_PARAMETERS object,
+		// override ProgressView to create your own loader. See dmloader.js for more details.
+	</script>
+	<script id='engine-start' type='text/javascript'>
+		var runningFromFileWarning = document.getElementById("running-from-file-warning");
+		if (window.location.href.startsWith("file://")) {
+			runningFromFileWarning.style.display = "block";
+		}
+		else {
+			EngineLoader.load("canvas", "{{exe-name}}");
+			runningFromFileWarning.parentNode.removeChild(runningFromFileWarning);
+		}
+	</script>
+</body>
+</html>

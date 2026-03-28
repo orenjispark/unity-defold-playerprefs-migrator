@@ -1,0 +1,81 @@
+local migrator   = require("main.migrator")
+
+-- ── CONFIG ────────────────────────────────────────────────────────────────────
+local UNITY_HASH = "" -- leave empty to auto-discover at runtime, or paste the MD5 hash here
+local SAVE_KEY   = "saveData"
+-- ─────────────────────────────────────────────────────────────────────────────
+
+local function pretty_json(str)
+	local result = {}
+	local indent = 0
+	local i = 1
+	while i <= #str do
+		local c = str:sub(i, i)
+		if c == "{" or c == "[" then
+			indent = indent + 1
+			result[#result + 1] = c .. "\n" .. string.rep("  ", indent)
+		elseif c == "}" or c == "]" then
+			indent = indent - 1
+			result[#result + 1] = "\n" .. string.rep("  ", indent) .. c
+		elseif c == "," then
+			result[#result + 1] = ",\n" .. string.rep("  ", indent)
+		elseif c == ":" then
+			result[#result + 1] = ": "
+		elseif c ~= " " or str:sub(i - 1, i - 1) == "\"" then
+			result[#result + 1] = c
+		end
+		i = i + 1
+	end
+	return table.concat(result)
+end
+
+
+
+function init(self)
+	local text_node = gui.get_node("save_data_text")
+
+	local function do_fetch(hash)
+		migrator.fetch(hash, SAVE_KEY, function(data, err)
+			if err then
+				print("[migrator] error:", err)
+				gui.set_text(text_node, "Error: " .. err)
+			elseif data == nil then
+				print("[migrator] no Unity save found – starting fresh")
+				gui.set_text(text_node, "No Unity save found – starting fresh")
+			else
+				print("[migrator] migration successful!")
+				local json_str = pretty_json(json.encode(data))
+				gui.set_text(text_node, json_str or "Migration successful, but failed to encode JSON")
+				pprint(data)
+			end
+		end)
+	end
+
+	if UNITY_HASH ~= "" then
+		-- Hash is hardcoded – go straight to fetch
+		do_fetch(UNITY_HASH)
+	else
+		-- Auto-discover the hash from IndexedDB at runtime
+		migrator.discover(function(hashes, err)
+			if err then
+				print("[migrator] discover error:", err)
+				gui.set_text(text_node, "Discover error: " .. err)
+				return
+			end
+			if not hashes or #hashes == 0 then
+				print("[migrator] no Unity IndexedDB found – starting fresh")
+				gui.set_text(text_node, "No Unity save found – starting fresh")
+				return
+			end
+			print("[migrator] discovered hash:", hashes[1])
+			do_fetch(hashes[1])
+		end)
+	end
+end
+
+function final(self)
+end
+
+function update(self, dt)
+	migrator.update()
+end
