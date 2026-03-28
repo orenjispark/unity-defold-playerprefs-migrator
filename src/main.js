@@ -1,8 +1,8 @@
 import './style.css';
 
 const games = {
-	unity: { src: '/unity-game/index.html', label: 'Unity Game' },
-	defold: { src: '/defold-game/index.html', label: 'Defold Game' },
+	unity: { src: './unity-game/index.html', label: 'Unity Game' },
+	defold: { src: './defold-game/index.html', label: 'Defold Game' },
 };
 
 let current = 'unity';
