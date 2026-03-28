@@ -2,6 +2,8 @@
 
 > **This is a test repo.** It's not a production library — just a working demo to explore whether Unity WebGL save data can be read by a Defold WebGL game running in the same browser.
 
+**[Try the live demo →](https://orenjispark.github.io/unity-defold-playerprefs-migrator/)**
+
 ---
 
 ## What is this?
